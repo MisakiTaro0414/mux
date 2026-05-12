@@ -1,0 +1,296 @@
+import math
+import warnings
+from typing import List, Optional, Tuple, Union, Dict, Any
+
+import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
+from torch import nn
+from torch.nn import CrossEntropyLoss
+
+from transformers.cache_utils import Cache, DynamicCache
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel, GPT2Model
+from .configuration_gpt2 import PCCoTGPT2Config
+from .generate import PCCoTGenerationMixin
+from .superpose import PCCoTSuperposeMixin
+
+
+class PCCoTGPT2LMHeadModel(PCCoTSuperposeMixin, GPT2LMHeadModel, PCCoTGenerationMixin):
+    
+    config_class = PCCoTGPT2Config
+
+    def __init__(self, config: PCCoTGPT2Config):
+        super(GPT2LMHeadModel, self).__init__(config)
+        self.transformer = GPT2Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
+
+        if config.use_projection:
+            hidden_dim = config.hidden_size
+            self.prj = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+            )
+        else:
+            self.prj = lambda x: x
+
+        self._log_cache: Dict[str, Any] = {}
+        self._init_superpose_state()
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        key_indices = None,
+        cot_input_ids = None,
+        cot_labels = None,
+        cot_attention_mask = None,
+        cot_kd_indices = None,
+        superpose_step_token_ids = None,
+        superpose_step_token_mask = None,
+        superpose_step_mask = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        r"""
+        Args:
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, LlamaForCausalLM
+
+        >>> model = LlamaForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+        >>> tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+
+        >>> prompt = "Hey, are you conscious? Can you talk to me?"
+        >>> inputs = tokenizer(prompt, return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        ```"""
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        teacher_inputs_available = cot_input_ids is not None and cot_attention_mask is not None
+        skip_teacher_objectives = (
+            not teacher_inputs_available
+            or (
+                self.training
+                and float(getattr(self.config, "loss_alpha", 1.0)) == 0.0
+                and float(getattr(self.config, "loss_gamma", 1.0)) == 0.0
+            )
+        )
+
+        ## Part 1. teacher CoT
+
+        outputs = None
+        logits = None
+        cot_loss = None
+        if not skip_teacher_objectives:
+            # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+            outputs = self.transformer(
+                input_ids=cot_input_ids,
+                attention_mask=cot_attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=True,
+                return_dict=return_dict,
+            )
+
+            hidden_states = outputs[0]
+            logits = self.lm_head(hidden_states)
+            logits = logits.float()
+
+            if cot_labels is not None:
+                # Shift so that tokens < n predict n
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = cot_labels[..., 1:].contiguous()
+                # Flatten the tokens
+                loss_fct = CrossEntropyLoss()
+                shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+                shift_labels = shift_labels.view(-1)
+                # Enable model parallelism
+                shift_labels = shift_labels.to(shift_logits.device)
+                cot_loss = loss_fct(shift_logits, shift_labels)
+
+        ## Part 2. student CoT
+            
+        # GPT-2 use absolute position embedding, and the implementation of huggingface is not compatible with the attention mask
+        # So we need to manually calculate the position ids
+        position_ids = attention_mask.cumsum(dim=-1) - 1
+        position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+            
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        question_boundary, latent_boundary, ccot_kd_index = key_indices
+        ccot_outputs = self.transformer(
+            input_ids=input_ids[:, :latent_boundary],
+            attention_mask=attention_mask[:, :latent_boundary],
+            position_ids=position_ids[:, :latent_boundary],
+            past_key_values=None,
+        )
+        prompt_superpose_hidden = ccot_outputs[0][:, question_boundary - 1 : question_boundary]
+        last_hidden_state = ccot_outputs[0][:, question_boundary-1:latent_boundary-1]
+        latent_input_embeds = self.prj(last_hidden_state)
+        question_past_key_values = [
+            (
+                ccot_outputs.past_key_values[l][0][:, :, :question_boundary],
+                ccot_outputs.past_key_values[l][1][:, :, :question_boundary]
+            )
+            for l in range(len(ccot_outputs.past_key_values))
+        ]
+
+        # iteratively predict the latent tokens
+        for _ in range(self.config.num_iterations):
+            # manually duplicate the past_key_values
+            ccot_past_key_values = question_past_key_values[:]
+            # update the ccot_outputs
+            ccot_outputs = self.transformer(
+                inputs_embeds=latent_input_embeds,
+                past_key_values=ccot_past_key_values,
+                position_ids=position_ids[:, question_boundary:latent_boundary]
+            )
+            # get the last hidden state
+            last_hidden_state = ccot_outputs[0]
+            # project the hidden state
+            projected_hidden_state = self.prj(last_hidden_state)
+            # get the new input_ids
+            latent_input_embeds = torch.cat([latent_input_embeds[:, :1], projected_hidden_state[:, :-1]], dim=1)
+        
+        # predict the answer
+        answer_outputs = self.transformer(
+            input_ids=input_ids[:, latent_boundary:],
+            attention_mask=attention_mask,
+            position_ids=position_ids[:, latent_boundary:],
+            past_key_values=ccot_outputs.past_key_values,
+            output_hidden_states=True,
+        )
+
+        # get the logits
+        answer_hidden_states = answer_outputs[0]
+        answer_logits = self.lm_head(answer_hidden_states)
+        answer_logits = answer_logits.float()
+
+        # calculate the loss
+        ccot_loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = answer_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            ccot_loss = loss_fct(shift_logits, shift_labels)
+
+        superpose_loss = torch.tensor(0.0, device=answer_hidden_states.device, dtype=answer_hidden_states.dtype)
+        superpose_logs: Dict[str, float] = {}
+        if (
+            bool(getattr(self.config, "ccot_superpose_kl", False))
+            and superpose_step_token_ids is not None
+            and superpose_step_token_mask is not None
+            and superpose_step_mask is not None
+        ):
+            latent_superpose_hidden = last_hidden_state
+            if bool(getattr(self.config, "ccot_superpose_k_plus_one_slots", True)):
+                latent_superpose_hidden = torch.cat([prompt_superpose_hidden, latent_superpose_hidden], dim=1)
+            superpose_loss, superpose_logs = self._compute_superpose_kl_loss(
+                student_slot_hidden_states=latent_superpose_hidden,
+                target_token_ids=superpose_step_token_ids,
+                target_token_mask=superpose_step_token_mask,
+                step_mask=superpose_step_mask,
+            )
+
+        ## Part 3. knowledge distillation
+        if skip_teacher_objectives or outputs is None or cot_kd_indices is None:
+            cot_loss = answer_logits.new_zeros(())
+            kd_loss = answer_logits.new_zeros(())
+            teacher_std = answer_logits.new_zeros(())
+            logits = answer_logits.new_empty((answer_logits.size(0), 0, answer_logits.size(-1)))
+        else:
+            teacher_hidden_states = torch.stack(outputs.hidden_states, dim=1).detach()[:, 1:] # (batch_size, num_layers, seq_len, hidden_size)
+            teacher_hidden_states = teacher_hidden_states.gather(2, cot_kd_indices[:, None, None, None].expand(-1, self.config.num_hidden_layers, -1, self.config.hidden_size))
+            student_hidden_states = torch.stack(answer_outputs.hidden_states, dim=1)[:, 1:, ccot_kd_index:ccot_kd_index+1]
+
+            if self.config.use_layerwise_std:
+                # transpose to (num_layers, batch_size, hidden_size)
+                teacher_hidden_states = teacher_hidden_states.transpose(0, 1).squeeze(2)
+                student_hidden_states = student_hidden_states.transpose(0, 1).squeeze(2)
+
+                # calculate the loss
+                kd_loss = F.smooth_l1_loss(student_hidden_states, teacher_hidden_states, reduction="none").reshape(self.config.num_hidden_layers, -1) # (num_layers, batch_size * hidden_size)
+                kd_loss /= teacher_hidden_states.reshape(self.config.num_hidden_layers, -1).std(dim=-1, keepdim=True)
+                kd_loss = kd_loss.mean()
+            else:
+                # calculate the loss
+                kd_loss = F.smooth_l1_loss(student_hidden_states, teacher_hidden_states)
+                kd_loss /= teacher_hidden_states.std()
+            teacher_std = teacher_hidden_states.std()
+
+        if cot_loss is None:
+            cot_loss = answer_logits.new_zeros(())
+        if ccot_loss is None:
+            ccot_loss = answer_logits.new_zeros(())
+
+        loss = (
+            cot_loss * self.config.loss_alpha
+            + ccot_loss * self.config.loss_beta
+            + kd_loss * self.config.loss_gamma
+            + superpose_loss
+        )
+
+        # log cache
+        self._log_cache = {
+            "cot_loss": cot_loss.item(),
+            "ccot_loss": ccot_loss.item(),
+            "kd_loss": kd_loss.item(),
+            "teacher_std": teacher_std.item(),
+            **superpose_logs,
+        }
+
+        logits_tuple = (answer_logits, logits)
+
+        if not return_dict:
+            output = (logits_tuple,) + (() if outputs is None else outputs[1:])
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits_tuple,
+            past_key_values=answer_outputs.past_key_values,
+            hidden_states=None if outputs is None else outputs.hidden_states,
+            attentions=None if outputs is None else outputs.attentions,
+        )
