@@ -103,7 +103,8 @@ CKPT_DIR=/path/to/checkpoint bash scripts/probe_latent_token.sh
   author    = {Suleymanzade, Ayhan and Gozeten, Halil Alperen and Bronstein, Michael and Ceylan, \.{I}smail \.{I}lkan and Kim, Jinwoo},
   title     = {{MUX}: Continuous Reasoning via Multiplexed Tokens},
   year      = {2026},
-}```
+}
+```
 
 ## Acknowledgments
 
