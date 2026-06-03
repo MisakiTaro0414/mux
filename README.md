@@ -100,9 +100,10 @@ CKPT_DIR=/path/to/checkpoint bash scripts/probe_latent_token.sh
 
 ```bibtex
 @misc{suleymanzade2026mux,
-  author    = {Suleymanzade, Ayhan and Gozeten, Halil Alperen and Bronstein, Michael and Ceylan, \.{I}smail \.{I}lkan and Kim, Jinwoo},
-  title     = {{MUX}: Continuous Reasoning via Multiplexed Tokens},
-  year      = {2026},
+  title={{MUX}: Continuous Reasoning via Multiplexed Tokens},
+  author={Suleymanzade, Ayhan and Gozeten, Halil Alperen and Bronstein, Michael and Ceylan, \.{I}smail \.{I}lkan and Kim, Jinwoo},
+  year={2026},
+  note={Forthcoming}
 }
 ```
 
