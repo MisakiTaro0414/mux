@@ -6,6 +6,8 @@
 
 <sup>1</sup>AITHYRA &nbsp;&nbsp; <sup>2</sup>University of Michigan &nbsp;&nbsp; <sup>3</sup>University of Oxford &nbsp;&nbsp; <sup>4</sup>TU Wien &nbsp;&nbsp; <sup>5</sup>KAIST &nbsp;&nbsp; <sup>&dagger;</sup>Equal advising
 
+**NeurIPS 2026 (Spotlight Presentation)**
+
 [![Project Page](https://img.shields.io/badge/%F0%9F%8C%90_Project_Page-6C3FC5)](https://misakitaro0414.github.io/mux/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB.svg)](https://www.python.org/)
@@ -99,11 +101,11 @@ CKPT_DIR=/path/to/checkpoint bash scripts/probe_latent_token.sh
 ## Citation
 
 ```bibtex
-@misc{suleymanzade2026mux,
-  title={{MUX}: Continuous Reasoning via Multiplexed Tokens},
-  author={Suleymanzade, Ayhan and Gozeten, Halil Alperen and Bronstein, Michael and Ceylan, \.{I}smail \.{I}lkan and Kim, Jinwoo},
-  year={2026},
-  note={Forthcoming}
+@article{suleymanzade2026mux,
+  title={MUX: Continuous Reasoning via Multiplexed Tokens},
+  author={Suleymanzade, Ayhan and Gozeten, Halil Alperen and Bronstein, Michael and Ceylan, {\.I}smail {\.I}lkan and Kim, Jinwoo},
+  journal={arXiv preprint arXiv:2607.18264},
+  year={2026}
 }
 ```
 
